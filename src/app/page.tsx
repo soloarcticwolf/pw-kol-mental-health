@@ -1,15 +1,20 @@
 'use client';
 import React, { useState, useRef, useEffect } from 'react';
 import { useUser, UserButton, SignInButton } from '@clerk/nextjs';
-import { Area, AreaChart, ResponsiveContainer, XAxis, YAxis, Tooltip } from 'recharts';
-import { Heart, Wind, Sparkles, Lightbulb, MessageCircle, Calendar, Flame, Send, X, BookOpen, BarChart2, Mic, Settings } from 'lucide-react';
+import dynamic from 'next/dynamic';
+import { Heart, Wind, Sparkles, Lightbulb, MessageCircle, Calendar, Flame, Send, X, BookOpen, Mic, Settings } from 'lucide-react';
+
+// Dynamic import for heavy charting library
+const ResponsiveContainer = dynamic(() => import('recharts').then(mod => mod.ResponsiveContainer), { ssr: false });
+const AreaChart = dynamic(() => import('recharts').then(mod => mod.AreaChart), { ssr: false });
+const Area = dynamic(() => import('recharts').then(mod => mod.Area), { ssr: false });
+const XAxis = dynamic(() => import('recharts').then(mod => mod.XAxis), { ssr: false });
+const YAxis = dynamic(() => import('recharts').then(mod => mod.YAxis), { ssr: false });
+const Tooltip = dynamic(() => import('recharts').then(mod => mod.Tooltip), { ssr: false });
 
 // ─── Constants ───────────────────────────────────────────────
 const EXAMS = ['NEET','JEE','UPSC','CUET','CAT','GATE'];
-const INITIAL_MOOD_HISTORY = [
-  {day:'Mon',score:3},{day:'Tue',score:2},{day:'Wed',score:4},
-  {day:'Thu',score:3},{day:'Fri',score:3},{day:'Sat',score:2},{day:'Sun',score:4}
-];
+const INITIAL_MOOD_HISTORY: {day:string; score:number}[] = [];
 const FALLBACK = {
   detected_trigger:'fear of falling behind',
   validation:"It's completely normal to feel like you're not doing enough when everyone else seems to be sprinting.",
@@ -44,6 +49,11 @@ const CRISIS_WORDS = ['suicide','kill myself','end it all','hopeless','harm myse
 type MoodScore = 1|2|3|4|5|null;
 interface AIResponse { detected_trigger:string; validation:string; coping_action:string; why_this_helps:string; encouragement:string; }
 interface ChatMessage { role:'user'|'ai'; content:string; }
+interface SpeechRecognitionEvent { results: { transcript: string }[][]; }
+interface IWindow extends Window {
+  SpeechRecognition?: any;
+  webkitSpeechRecognition?: any;
+}
 
 
 // ─── Setup Screen ─────────────────────────────────────────────
@@ -108,6 +118,13 @@ export default function SahayApp() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
 
+  // ─── True Gemini Live WebSocket Logic Refs ──────────────────────
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const nextPlayTimeRef = useRef<number>(0);
+
   useEffect(()=>{
     if(isChatOpen) chatEndRef.current?.scrollIntoView({behavior:'smooth'});
   },[chatMessages,isChatOpen]);
@@ -125,24 +142,7 @@ export default function SahayApp() {
     }
   }, []);
 
-  // Initialize Speech Recognition
-  useEffect(() => {
-    if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = false;
-      recognitionRef.current.lang = 'en-US';
 
-      recognitionRef.current.onresult = async (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        setIsListening(false);
-        await handleVoiceChat(transcript);
-      };
-      recognitionRef.current.onend = () => setIsListening(false);
-      recognitionRef.current.onerror = () => setIsListening(false);
-    }
-  }, [exam, journal]);
 
   if (!isLoaded || isSetupComplete === null) return null;
   if (!user) return <SignInGate />;
@@ -175,12 +175,18 @@ export default function SahayApp() {
       const data = await res.json();
       setAiResponse(data);
       setStreak(p=>p+1);
-      setMoodHistory(p=>[...p.slice(1),{day:'Today',score:mood as number}]);
+      setMoodHistory(p=>{
+        const newDay = new Date().toLocaleDateString('en-US',{weekday:'short'});
+        return [...p, {day:newDay, score:mood as number}].slice(-7);
+      });
     } catch {
       setTimeout(()=>{
         setAiResponse(FALLBACK);
         setStreak(p=>p+1);
-        setMoodHistory(p=>[...p.slice(1),{day:'Today',score:mood as number}]);
+        setMoodHistory(p=>{
+          const newDay = new Date().toLocaleDateString('en-US',{weekday:'short'});
+          return [...p, {day:newDay, score:mood as number}].slice(-7);
+        });
       },1200);
     } finally { setIsLoading(false); }
   };
@@ -199,64 +205,160 @@ export default function SahayApp() {
     } finally { setIsChatLoading(false); }
   };
 
-  // ─── Voice Logic ─────────────────────────────────────────────
-  const startListening = () => {
-    if (isSpeaking) window.speechSynthesis.cancel();
-    setIsSpeaking(false);
-    if (recognitionRef.current) {
-      setIsListening(true);
-      recognitionRef.current.start();
-    } else {
-      alert("Speech recognition not supported in this browser. Please try Chrome or Edge.");
-    }
-  };
+  // ─── True Gemini Live WebSocket Logic ─────────────────────────
 
-  const handleVoiceChat = async (msg: string) => {
+  const startListening = async () => {
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    if (!apiKey) return alert("Missing NEXT_PUBLIC_GEMINI_API_KEY in .env.local");
+
     try {
-      const res = await fetch('/api/chat',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        // Send journal as context so the AI knows why the user is low
-        body:JSON.stringify({message: msg, examName: exam, voiceContext: journal })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        speakResponse(data.reply);
+      // 0. Get Microphone Permission FIRST
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
+      mediaStreamRef.current = stream;
+
+      setIsVoiceOpen(true);
+      setIsSpeaking(false);
+      setIsListening(true);
+      // 1. Fetch fast Exa context
+      let researchCtx = '';
+      if (journal) {
+        const res = await fetch('/api/research', { method:'POST', body:JSON.stringify({ topic:journal, examName:exam }) });
+        if (res.ok) researchCtx = (await res.json()).research || '';
       }
+
+      // 2. Open WebSocket
+      const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = async () => {
+        // Send Setup
+        ws.send(JSON.stringify({
+          setup: {
+            model: "models/gemini-2.5-flash",
+            systemInstruction: {
+              parts: [{ text: `You are an incredibly positive, encouraging, and highly energetic companion for a student preparing for ${exam}. Never be preachy. Be a huge cheerleader. Keep replies strictly under 30 words. Use this specific research context to give them facts if they mention their struggles: ${researchCtx}` }]
+            },
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } }
+            }
+          }
+        }));
+
+        // Initial Greeting context
+        ws.send(JSON.stringify({
+          clientContent: {
+            turns: [{
+              role: "user",
+              parts: [{ text: journal ? `Hi. I just journaled: "${journal}". Can you give me some quick encouragement?` : `Hi Sahay! I'm ready to talk.` }]
+            }],
+            turnComplete: true
+          }
+        }));
+
+        // 3. Start Audio Capture (16kHz PCM)
+        const ac = new window.AudioContext({ sampleRate: 16000 });
+        audioCtxRef.current = ac;
+
+        // stream is already captured in mediaStreamRef
+        const source = ac.createMediaStreamSource(mediaStreamRef.current!);
+        const processor = ac.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        processor.onaudioprocess = (e) => {
+          if (ws.readyState !== WebSocket.OPEN || isSpeaking) return;
+          const pcm = e.inputBuffer.getChannelData(0);
+          const pcm16 = new Int16Array(pcm.length);
+          for (let i = 0; i < pcm.length; i++) {
+            pcm16[i] = Math.max(-1, Math.min(1, pcm[i])) * 0x7FFF;
+          }
+          // Convert Int16Array to base64
+          const buffer = new Uint8Array(pcm16.buffer);
+          let binary = '';
+          for (let i = 0; i < buffer.byteLength; i++) binary += String.fromCharCode(buffer[i]);
+          const base64 = btoa(binary);
+
+          ws.send(JSON.stringify({ realtimeInput: { mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: base64 }] } }));
+        };
+
+        source.connect(processor);
+        processor.connect(ac.destination);
+      };
+
+      ws.onmessage = async (event) => {
+        let textData = event.data;
+        if (event.data instanceof Blob) {
+          textData = await event.data.text();
+        }
+        const msg = JSON.parse(textData);
+
+        // Check for Audio Output (24kHz PCM)
+        const parts = msg.serverContent?.modelTurn?.parts;
+        if (parts) {
+          for (const p of parts) {
+            if (p.inlineData && p.inlineData.data) {
+              playBase64Audio(p.inlineData.data);
+            }
+          }
+        }
+      };
+
     } catch (e) {
       console.error(e);
-      setIsListening(false);
+      closeVoiceSession();
     }
   };
 
-  const speakResponse = (text: string) => {
-    if (typeof window === 'undefined') return;
-    const utterance = new SpeechSynthesisUtterance(text);
-    // Remove emojis/markdown for TTS
-    utterance.text = text.replace(/[*#]/g, '').replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '');
-    utterance.rate = 1.05;
-    
+  const playBase64Audio = (base64: string) => {
+    if (!audioCtxRef.current) return;
     setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    utterance.onerror = () => setIsSpeaking(false);
-    window.speechSynthesis.speak(utterance);
+    setIsListening(false);
+
+    const binaryString = atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+    
+    const int16Array = new Int16Array(bytes.buffer);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 0x7FFF;
+    }
+
+    const audioBuffer = audioCtxRef.current.createBuffer(1, float32Array.length, 24000);
+    audioBuffer.getChannelData(0).set(float32Array);
+
+    const source = audioCtxRef.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioCtxRef.current.destination);
+    
+    // Sequence chunks smoothly
+    const currentTime = audioCtxRef.current.currentTime;
+    const startTime = Math.max(nextPlayTimeRef.current, currentTime);
+    source.start(startTime);
+    nextPlayTimeRef.current = startTime + audioBuffer.duration;
+
+    source.onended = () => {
+      if (audioCtxRef.current && audioCtxRef.current.currentTime >= nextPlayTimeRef.current - 0.1) {
+        setIsSpeaking(false);
+        setIsListening(true);
+      }
+    };
   };
 
   const openVoiceSession = () => {
-    setIsVoiceOpen(true);
-    // AI initiates the conversation based on the journal context
-    const greeting = journal 
-      ? `Hey ${firstName}. I read your journal. I'm so sorry you're feeling this way about ${exam}. Tell me what's going on.`
-      : `Hey ${firstName}, I'm here. What's on your mind?`;
-    speakResponse(greeting);
+    startListening();
   };
 
   const closeVoiceSession = () => {
     setIsVoiceOpen(false);
-    if (isSpeaking) window.speechSynthesis.cancel();
-    if (isListening && recognitionRef.current) recognitionRef.current.stop();
-    setIsSpeaking(false);
     setIsListening(false);
+    setIsSpeaking(false);
+    if (wsRef.current) wsRef.current.close();
+    if (processorRef.current) processorRef.current.disconnect();
+    if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
+    if (audioCtxRef.current) audioCtxRef.current.close();
   };
 
   const MOODS = [{s:1,e:'😫',l:'Awful'},{s:2,e:'😔',l:'Bad'},{s:3,e:'😐',l:'Okay'},{s:4,e:'🙂',l:'Good'},{s:5,e:'🤩',l:'Great'}];
@@ -285,7 +387,7 @@ export default function SahayApp() {
           <p className="section-label">Your Exam</p>
           <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',background:'var(--bg-card)',padding:'12px 16px',borderRadius:'var(--r-md)',border:'1px solid var(--border)'}}>
             <span style={{fontWeight:700,fontSize:14}}>{exam}</span>
-            <button onClick={()=>setIsSetupComplete(false)} style={{background:'transparent',border:'none',color:'var(--text-muted)',cursor:'pointer'}}>
+            <button aria-label="Settings" onClick={()=>setIsSetupComplete(false)} style={{background:'transparent',border:'none',color:'var(--text-muted)',cursor:'pointer'}}>
               <Settings size={15}/>
             </button>
           </div>
@@ -300,8 +402,8 @@ export default function SahayApp() {
             <button className="nav-item" onClick={()=>setIsChatOpen(true)}>
               <MessageCircle size={16}/> Chat via text
             </button>
-            <button className="nav-item" onClick={openVoiceSession}>
-              <Mic size={16}/> Talk to Sahay
+            <button className="nav-item" onClick={openVoiceSession} style={{color: '#10b981', textShadow: '0 0 8px rgba(16, 185, 129, 0.4)'}}>
+              <Mic size={16}/> Talk to me
             </button>
           </div>
         </div>
@@ -407,8 +509,8 @@ export default function SahayApp() {
                       <p style={{fontSize:15,fontWeight:800,marginBottom:2}}>You seem really stressed.</p>
                       <p style={{fontSize:14,color:'var(--text-secondary)'}}>Would you like to talk it out with Sahay?</p>
                     </div>
-                    <button className="btn-primary" onClick={openVoiceSession} style={{padding:'10px 18px',fontSize:14}}>
-                      <Mic size={15}/> Voice Call
+                    <button className="btn-primary" onClick={openVoiceSession} style={{padding:'10px 18px',fontSize:14, background:'linear-gradient(135deg, #059669, #10b981)', border:'none', boxShadow:'0 0 15px rgba(16, 185, 129, 0.6)'}}>
+                      <Mic size={15}/> Talk to me
                     </button>
                   </div>
                 )}
@@ -456,7 +558,7 @@ export default function SahayApp() {
                   <p style={{fontSize:12,color:'var(--text-muted)'}}>Sahay is here to listen</p>
                 </div>
               </div>
-              <button onClick={()=>setIsChatOpen(false)} style={{width:32,height:32,borderRadius:'50%',border:'none',background:'var(--bg-input)',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',color:'var(--text-muted)'}}>
+              <button aria-label="Close text chat" onClick={()=>setIsChatOpen(false)} style={{width:32,height:32,borderRadius:'50%',border:'none',background:'var(--bg-input)',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',color:'var(--text-muted)'}}>
                 <X size={16}/>
               </button>
             </div>
@@ -474,8 +576,8 @@ export default function SahayApp() {
               <div ref={chatEndRef}/>
             </div>
             <div className="chat-input-bar">
-              <input className="chat-input" placeholder="Type a message..." value={chatInput} onChange={e=>setChatInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&handleSendChat()}/>
-              <button className="chat-send" onClick={handleSendChat} disabled={!chatInput.trim()||isChatLoading}>
+              <input aria-label="Chat input" className="chat-input" placeholder="Type a message..." value={chatInput} onChange={e=>setChatInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&handleSendChat()}/>
+              <button aria-label="Send message" className="chat-send" onClick={handleSendChat} disabled={!chatInput.trim()||isChatLoading}>
                 <Send size={17} style={{marginLeft:2}}/>
               </button>
             </div>
@@ -485,12 +587,12 @@ export default function SahayApp() {
 
       {/* Voice Chat Modal */}
       {isVoiceOpen && (
-        <div className="voice-modal">
-          <button onClick={closeVoiceSession} style={{position:'absolute',top:32,right:32,background:'var(--bg-input)',border:'none',width:48,height:48,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',color:'var(--text-muted)'}}>
+        <div className="voice-modal" role="dialog" aria-modal="true" aria-labelledby="voice-modal-title">
+          <button aria-label="Close voice chat" onClick={closeVoiceSession} style={{position:'absolute',top:32,right:32,background:'var(--bg-input)',border:'none',width:48,height:48,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',color:'var(--text-muted)'}}>
             <X size={24}/>
           </button>
           
-          <h2 style={{fontSize:32,fontWeight:800,marginBottom:12,letterSpacing:'-0.02em'}}>Voice Call with Sahay</h2>
+          <h2 id="voice-modal-title" style={{fontSize:32,fontWeight:800,marginBottom:12,letterSpacing:'-0.02em'}}>Voice Call with Sahay</h2>
           <p style={{color:'var(--text-secondary)',fontSize:16,marginBottom:80}}>
             {isSpeaking ? "Sahay is speaking..." : isListening ? "Listening... Speak now." : "Press the mic to talk"}
           </p>
