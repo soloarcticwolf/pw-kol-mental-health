@@ -400,3 +400,40 @@ body {
   .login-right { width: 100%; padding: 48px 32px; }
   .chat-panel { right: 0; left: 0; width: 100%; border-radius: var(--r-2xl) var(--r-2xl) 0 0; }
 }
+
+/* ─── Voice Modal & Orbs ─────────────────────────────────── */
+.voice-modal {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(243, 241, 234, 0.95);
+  backdrop-filter: blur(12px);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  animation: fadeIn 0.3s ease;
+}
+.orb-container {
+  display: flex; gap: 64px; margin-bottom: 48px;
+}
+.orb {
+  width: 130px; height: 130px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.3s ease;
+  position: relative;
+  z-index: 2;
+}
+.orb::before {
+  content: ''; position: absolute; inset: -15px; border-radius: 50%;
+  border: 2px solid transparent; transition: all 0.3s ease;
+  z-index: -1;
+}
+.orb.user { background: var(--bg-card); box-shadow: var(--shadow-md); color: var(--text-primary); }
+.orb.ai { background: linear-gradient(135deg, var(--accent), var(--accent-light)); color: white; box-shadow: var(--shadow-glow); }
+.orb.active::before { border-color: var(--accent); animation: pulse-orb 1.5s cubic-bezier(0.16, 1, 0.3, 1) infinite; }
+.orb.ai.active::before { border-color: var(--accent-light); animation: pulse-orb-ai 1.2s cubic-bezier(0.16, 1, 0.3, 1) infinite; }
+
+@keyframes pulse-orb {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(1.4); opacity: 0; }
+}
+@keyframes pulse-orb-ai {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
