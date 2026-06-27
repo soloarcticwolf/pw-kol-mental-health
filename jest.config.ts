@@ -18,7 +18,10 @@ const config: Config = {
     '!src/app/api/**/*',
     '!src/app/layout.tsx',
   ],
-  testPathIgnorePatterns: ['<rootDir>/tests/'],
+  testPathIgnorePatterns: ['<rootDir>/tests/', '<rootDir>/__tests__/test_'],
+  moduleNameMapper: {
+    '^@google/genai$': '<rootDir>/__mocks__/@google/genai.js',
+  }
 };
 
 // createJestConfig is exported this way to ensure that next/jest can load the Next.js config which is async

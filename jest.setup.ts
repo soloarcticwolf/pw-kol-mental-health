@@ -44,3 +44,5 @@ jest.mock('next/navigation', () => ({
     return '';
   },
 }));
+
+window.HTMLElement.prototype.scrollIntoView = jest.fn();
