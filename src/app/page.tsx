@@ -1,6 +1,7 @@
 'use client';
 import React, { useState, useRef, useEffect } from 'react';
 import { useUser, UserButton, SignInButton } from '@clerk/nextjs';
+import { GoogleGenAI } from '@google/genai';
 import dynamic from 'next/dynamic';
 import { Heart, Wind, Sparkles, Lightbulb, MessageCircle, Calendar, Flame, Send, X, BookOpen, Mic, Settings } from 'lucide-react';
 
@@ -110,7 +111,9 @@ export default function SahayApp() {
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
   
-  // Voice state
+  // Voice & Context state
+  const [isPreparingContext, setIsPreparingContext] = useState(false);
+  const [currentResearchCtx, setCurrentResearchCtx] = useState('');
   const [isVoiceOpen, setIsVoiceOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -118,12 +121,13 @@ export default function SahayApp() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
 
-  // ─── True Gemini Live WebSocket Logic Refs ──────────────────────
-  const wsRef = useRef<WebSocket | null>(null);
+  // ─── True Gemini Live WebSocket Logic ─────────────────────────
+  const sessionRef = useRef<any>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
+  const [isWsReady, setIsWsReady] = useState(false);
 
   useEffect(()=>{
     if(isChatOpen) chatEndRef.current?.scrollIntoView({behavior:'smooth'});
@@ -141,6 +145,8 @@ export default function SahayApp() {
       setIsSetupComplete(false);
     }
   }, []);
+
+
 
 
 
@@ -191,12 +197,27 @@ export default function SahayApp() {
     } finally { setIsLoading(false); }
   };
 
+  const prepareContext = async (): Promise<string> => {
+    if (currentResearchCtx) return currentResearchCtx;
+    setIsPreparingContext(true);
+    let ctx = '';
+    if (journal) {
+      try {
+        const res = await fetch('/api/research', { method:'POST', body:JSON.stringify({ topic:journal, examName:exam }) });
+        if (res.ok) ctx = (await res.json()).research || '';
+      } catch(e) { console.error(e); }
+    }
+    setCurrentResearchCtx(ctx);
+    setIsPreparingContext(false);
+    return ctx;
+  };
+
   const handleSendChat = async () => {
     if (!chatInput.trim() || isChatLoading) return;
     const msg = chatInput.trim(); setChatInput('');
     setChatMessages(p=>[...p,{role:'user',content:msg}]); setIsChatLoading(true);
     try {
-      const res = await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,examName:exam})});
+      const res = await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,examName:exam, researchContext: currentResearchCtx, voiceContext: journal})});
       if (!res.ok) throw new Error();
       const data = await res.json();
       setChatMessages(p=>[...p,{role:'ai',content:data.reply}]);
@@ -207,7 +228,7 @@ export default function SahayApp() {
 
   // ─── True Gemini Live WebSocket Logic ─────────────────────────
 
-  const startListening = async () => {
+  const startListening = async (researchCtx: string) => {
     const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
     if (!apiKey) return alert("Missing NEXT_PUBLIC_GEMINI_API_KEY in .env.local");
 
@@ -219,93 +240,84 @@ export default function SahayApp() {
       setIsVoiceOpen(true);
       setIsSpeaking(false);
       setIsListening(true);
-      // 1. Fetch fast Exa context
-      let researchCtx = '';
-      if (journal) {
-        const res = await fetch('/api/research', { method:'POST', body:JSON.stringify({ topic:journal, examName:exam }) });
-        if (res.ok) researchCtx = (await res.json()).research || '';
-      }
+      setIsWsReady(false);
 
-      // 2. Open WebSocket
-      const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      const ai = new GoogleGenAI({ 
+        apiKey: apiKey,
+        vertexai: true
+      });
 
-      ws.onopen = async () => {
-        // Send Setup
-        ws.send(JSON.stringify({
-          setup: {
-            model: "models/gemini-2.5-flash",
-            systemInstruction: {
-              parts: [{ text: `You are an incredibly positive, encouraging, and highly energetic companion for a student preparing for ${exam}. Never be preachy. Be a huge cheerleader. Keep replies strictly under 30 words. Use this specific research context to give them facts if they mention their struggles: ${researchCtx}` }]
-            },
-            generationConfig: {
-              responseModalities: ["AUDIO"],
-              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } }
+      const session = await ai.live.connect({
+        model: "gemini-2.5-flash",
+        config: {
+          systemInstruction: {
+            parts: [{ text: `You are an incredibly positive, encouraging, and highly energetic companion for a student preparing for ${exam}. Never be preachy. Be a huge cheerleader. Keep replies strictly under 30 words. You must strictly converse in English. Use this specific research context to give them facts if they mention their struggles: ${researchCtx}` }]
+          },
+          responseModalities: ["AUDIO"] as any,
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } }
+        },
+        callbacks: {
+          onmessage: (msg: any) => {
+            const parts = msg.serverContent?.modelTurn?.parts;
+            if (parts) {
+              for (const p of parts) {
+                if (p.inlineData && p.inlineData.data) {
+                  playBase64Audio(p.inlineData.data);
+                }
+              }
             }
-          }
-        }));
+          },
+          onerror: (err: any) => console.error("Session Error", err),
+          onclose: () => closeVoiceSession()
+        }
+      } as any);
+      sessionRef.current = session;
+      setIsWsReady(true);
 
-        // Initial Greeting context
-        ws.send(JSON.stringify({
-          clientContent: {
-            turns: [{
-              role: "user",
-              parts: [{ text: journal ? `Hi. I just journaled: "${journal}". Can you give me some quick encouragement?` : `Hi Sahay! I'm ready to talk.` }]
-            }],
-            turnComplete: true
-          }
-        }));
+      // Send Initial Greeting
+      session.sendClientContent({
+        turns: [{
+          role: "user",
+          parts: [{ text: journal ? `Hi. I just journaled: "${journal}". Can you give me some quick encouragement?` : `Hi Sahay! I'm ready to talk.` }]
+        }],
+        turnComplete: true
+      });
 
-        // 3. Start Audio Capture (16kHz PCM)
-        const ac = new window.AudioContext({ sampleRate: 16000 });
-        audioCtxRef.current = ac;
+      // Start Microphone Capture
+      const ac = new window.AudioContext({ sampleRate: 16000 });
+      audioCtxRef.current = ac;
+      
+      const source = ac.createMediaStreamSource(mediaStreamRef.current!);
+      const processor = ac.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
 
-        // stream is already captured in mediaStreamRef
-        const source = ac.createMediaStreamSource(mediaStreamRef.current!);
-        const processor = ac.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
+      processor.onaudioprocess = (e) => {
+        if (isSpeaking) return; 
 
-        processor.onaudioprocess = (e) => {
-          if (ws.readyState !== WebSocket.OPEN || isSpeaking) return;
-          const pcm = e.inputBuffer.getChannelData(0);
-          const pcm16 = new Int16Array(pcm.length);
-          for (let i = 0; i < pcm.length; i++) {
-            pcm16[i] = Math.max(-1, Math.min(1, pcm[i])) * 0x7FFF;
-          }
-          // Convert Int16Array to base64
-          const buffer = new Uint8Array(pcm16.buffer);
-          let binary = '';
-          for (let i = 0; i < buffer.byteLength; i++) binary += String.fromCharCode(buffer[i]);
-          const base64 = btoa(binary);
+        const pcm = e.inputBuffer.getChannelData(0);
+        const pcm16 = new Int16Array(pcm.length);
+        for (let i = 0; i < pcm.length; i++) {
+          pcm16[i] = Math.max(-1, Math.min(1, pcm[i])) * 0x7FFF;
+        }
+        
+        const buffer = new Uint8Array(pcm16.buffer);
+        let binary = '';
+        for (let i = 0; i < buffer.byteLength; i++) binary += String.fromCharCode(buffer[i]);
+        const base64 = btoa(binary);
 
-          ws.send(JSON.stringify({ realtimeInput: { mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: base64 }] } }));
-        };
-
-        source.connect(processor);
-        processor.connect(ac.destination);
+        try {
+          session.sendRealtimeInput([{ mimeType: "audio/pcm;rate=16000", data: base64 }] as any);
+        } catch (err) {}
       };
 
-      ws.onmessage = async (event) => {
-        let textData = event.data;
-        if (event.data instanceof Blob) {
-          textData = await event.data.text();
-        }
-        const msg = JSON.parse(textData);
+      source.connect(processor);
+      processor.connect(ac.destination);
 
-        // Check for Audio Output (24kHz PCM)
-        const parts = msg.serverContent?.modelTurn?.parts;
-        if (parts) {
-          for (const p of parts) {
-            if (p.inlineData && p.inlineData.data) {
-              playBase64Audio(p.inlineData.data);
-            }
-          }
-        }
-      };
+
 
     } catch (e) {
-      console.error(e);
+      console.error("SDK Connection Error:", e);
+      alert("Voice connection error. Please try again.");
       closeVoiceSession();
     }
   };
@@ -347,15 +359,23 @@ export default function SahayApp() {
     };
   };
 
-  const openVoiceSession = () => {
-    startListening();
+  const openVoiceSession = async () => {
+    const ctx = await prepareContext();
+    startListening(ctx);
+  };
+
+  const openChatSession = async () => {
+    await prepareContext();
+    setIsChatOpen(true);
   };
 
   const closeVoiceSession = () => {
     setIsVoiceOpen(false);
     setIsListening(false);
     setIsSpeaking(false);
-    if (wsRef.current) wsRef.current.close();
+    if (sessionRef.current) {
+       try { sessionRef.current.close(); } catch (e) {}
+    }
     if (processorRef.current) processorRef.current.disconnect();
     if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
     if (audioCtxRef.current) audioCtxRef.current.close();
@@ -399,11 +419,13 @@ export default function SahayApp() {
             <button className="nav-item active">
               <BookOpen size={16}/> Daily Check-in
             </button>
-            <button className="nav-item" onClick={()=>setIsChatOpen(true)}>
-              <MessageCircle size={16}/> Chat via text
+            <button className="nav-item" onClick={openChatSession} disabled={isPreparingContext}>
+              {isPreparingContext ? <Sparkles size={16} className="animate-pulse-soft"/> : <MessageCircle size={16}/>} 
+              {isPreparingContext ? 'Preparing...' : 'Chat via text'}
             </button>
-            <button className="nav-item" onClick={openVoiceSession} style={{color: '#10b981', textShadow: '0 0 8px rgba(16, 185, 129, 0.4)'}}>
-              <Mic size={16}/> Talk to me
+            <button className="nav-item" onClick={openVoiceSession} disabled={isPreparingContext} style={{color: '#10b981', textShadow: '0 0 8px rgba(16, 185, 129, 0.4)'}}>
+              {isPreparingContext ? <Sparkles size={16} className="animate-pulse-soft"/> : <Mic size={16}/>} 
+              {isPreparingContext ? 'Preparing...' : 'Talk to me'}
             </button>
           </div>
         </div>
@@ -509,8 +531,9 @@ export default function SahayApp() {
                       <p style={{fontSize:15,fontWeight:800,marginBottom:2}}>You seem really stressed.</p>
                       <p style={{fontSize:14,color:'var(--text-secondary)'}}>Would you like to talk it out with Sahay?</p>
                     </div>
-                    <button className="btn-primary" onClick={openVoiceSession} style={{padding:'10px 18px',fontSize:14, background:'linear-gradient(135deg, #059669, #10b981)', border:'none', boxShadow:'0 0 15px rgba(16, 185, 129, 0.6)'}}>
-                      <Mic size={15}/> Talk to me
+                    <button className="btn-primary" onClick={openVoiceSession} disabled={isPreparingContext} style={{padding:'10px 18px',fontSize:14, background:'linear-gradient(135deg, #059669, #10b981)', border:'none', boxShadow:'0 0 15px rgba(16, 185, 129, 0.6)'}}>
+                      {isPreparingContext ? <Sparkles size={15} className="animate-pulse-soft"/> : <Mic size={15}/>} 
+                      {isPreparingContext ? 'Preparing...' : 'Talk to me'}
                     </button>
                   </div>
                 )}
@@ -607,7 +630,7 @@ export default function SahayApp() {
           </div>
 
           {!isListening && !isSpeaking && (
-            <button className="btn-primary" onClick={startListening} style={{padding:'16px 32px',fontSize:18,borderRadius:30}}>
+            <button className="btn-primary" onClick={() => startListening(currentResearchCtx)} style={{padding:'16px 32px',fontSize:18,borderRadius:30}}>
               <Mic size={20}/> Tap to Speak
             </button>
           )}
